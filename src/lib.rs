@@ -1,17 +1,19 @@
-//! Unix socket IPC with msgpack serialization
+//! Unix socket IPC with msgpack serialization and SO_PEERCRED caller info
 //!
 //! Provides simple request/response communication over Unix sockets
-//! using MessagePack for fast binary serialization.
+//! using MessagePack for fast binary serialization. Includes caller
+//! identification via SO_PEERCRED (uid, gid, pid, exe path).
 //!
 //! # Example
 //!
 //! Server:
 //! ```ignore
-//! use unix_ipc::{Server, CallerInfo};
+//! use peercred_ipc::{Server, CallerInfo};
 //!
 //! let server = Server::bind("/run/myapp.sock")?;
 //! loop {
 //!     let (mut conn, caller) = server.accept().await?;
+//!     println!("Request from uid={} pid={}", caller.uid, caller.pid);
 //!     let request: MyRequest = conn.read().await?;
 //!     conn.write(&MyResponse::Ok).await?;
 //! }
@@ -19,7 +21,7 @@
 //!
 //! Client:
 //! ```ignore
-//! use unix_ipc::Client;
+//! use peercred_ipc::Client;
 //!
 //! let response: MyResponse = Client::call("/run/myapp.sock", &request)?;
 //! ```
@@ -200,7 +202,12 @@ mod tests {
 
     fn unique_socket_path(prefix: &str) -> String {
         let id = SOCKET_COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("/tmp/unix-ipc-test-{}-{}-{}.sock", prefix, std::process::id(), id)
+        format!(
+            "/tmp/peercred-ipc-test-{}-{}-{}.sock",
+            prefix,
+            std::process::id(),
+            id
+        )
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -277,7 +284,13 @@ mod tests {
 
         let path = socket_path.clone();
         let resp: StringMessage = tokio::task::spawn_blocking(move || {
-            Client::call(&path, &StringMessage { text: "hello world".to_string() }).unwrap()
+            Client::call(
+                &path,
+                &StringMessage {
+                    text: "hello world".to_string(),
+                },
+            )
+            .unwrap()
         })
         .await
         .unwrap();
@@ -335,7 +348,10 @@ mod tests {
             IpcError::ConnectionClosed => {}
             IpcError::Io(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
             IpcError::Io(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-            e => panic!("Expected ConnectionClosed or ConnectionReset/BrokenPipe, got {:?}", e),
+            e => panic!(
+                "Expected ConnectionClosed or ConnectionReset/BrokenPipe, got {:?}",
+                e
+            ),
         }
 
         server_handle.await.unwrap();
@@ -389,7 +405,9 @@ mod tests {
         let path = socket_path.clone();
         tokio::task::spawn_blocking(move || {
             let mut stream = UnixStream::connect(&path).unwrap();
-            stream.write_all(b"this is not valid msgpack data!").unwrap();
+            stream
+                .write_all(b"this is not valid msgpack data!")
+                .unwrap();
         })
         .await
         .unwrap();
@@ -471,7 +489,9 @@ mod tests {
             // Should contain the test binary name
             let exe_str = caller.exe.to_string_lossy();
             assert!(
-                exe_str.contains("unix-ipc") || exe_str.contains("unix_ipc") || exe_str.contains("deps"),
+                exe_str.contains("peercred-ipc")
+                    || exe_str.contains("peercred_ipc")
+                    || exe_str.contains("deps"),
                 "exe path should contain test binary reference: {}",
                 exe_str
             );
@@ -587,7 +607,11 @@ mod tests {
                 let (mut conn, _) = server.accept().await.unwrap();
                 let req: TestRequest = conn.read().await.unwrap();
                 assert_eq!(req.value, i);
-                conn.write(&TestResponse { doubled: req.value * 2 }).await.unwrap();
+                conn.write(&TestResponse {
+                    doubled: req.value * 2,
+                })
+                .await
+                .unwrap();
             }
         });
 
@@ -622,7 +646,11 @@ mod tests {
                     let req: TestRequest = conn.read().await.unwrap();
                     // Simulate some work
                     tokio::time::sleep(Duration::from_millis(5)).await;
-                    conn.write(&TestResponse { doubled: req.value * 2 }).await.unwrap();
+                    conn.write(&TestResponse {
+                        doubled: req.value * 2,
+                    })
+                    .await
+                    .unwrap();
                 }));
             }
             for h in handles {
@@ -665,7 +693,11 @@ mod tests {
 
             for _ in 0..3 {
                 let req: TestRequest = conn.read().await.unwrap();
-                conn.write(&TestResponse { doubled: req.value * 2 }).await.unwrap();
+                conn.write(&TestResponse {
+                    doubled: req.value * 2,
+                })
+                .await
+                .unwrap();
             }
         });
 

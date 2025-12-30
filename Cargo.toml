@@ -1,10 +1,13 @@
 [package]
-name = "unix-ipc"
+name = "peercred-ipc"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 license = "MIT"
 authors = ["Alessio Deiana <adeiana@gmail.com>"]
-description = "Unix socket IPC with msgpack serialization"
+description = "Unix socket IPC with msgpack serialization and SO_PEERCRED caller info"
+repository = "https://github.com/Osso/peercred-ipc"
+keywords = ["ipc", "unix-socket", "msgpack", "peercred"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
