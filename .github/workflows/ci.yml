@@ -31,3 +31,4 @@ jobs:
 
       - name: Run tests
         run: cargo test
+        timeout-minutes: 5
