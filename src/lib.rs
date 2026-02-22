@@ -33,6 +33,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream as TokioUnixStream};
@@ -53,6 +54,17 @@ pub enum IpcError {
 
     #[error("connection closed")]
     ConnectionClosed,
+
+    #[error("timeout: {0}")]
+    Timeout(std::io::Error),
+}
+
+/// Returns true if the io::Error represents a timeout (TimedOut or WouldBlock).
+pub fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
 }
 
 /// Information about the connected peer, extracted from socket credentials
@@ -328,6 +340,51 @@ impl Client {
 
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf)?;
+        Ok(rmp_serde::from_slice(&buf)?)
+    }
+
+    /// Connect to a socket and perform a single request/response exchange with a timeout.
+    ///
+    /// Identical to `call` but sets read and write timeouts on the socket after connecting.
+    /// Returns `IpcError::Timeout` if any I/O operation exceeds the given duration.
+    pub fn call_timeout<P, Req, Res>(path: P, request: &Req, timeout: Duration) -> Result<Res, IpcError>
+    where
+        P: AsRef<Path>,
+        Req: Serialize,
+        Res: DeserializeOwned,
+    {
+        let mut stream = UnixStream::connect(path)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+
+        let data = rmp_serde::to_vec(request)?;
+        let len = data.len() as u32;
+        stream.write_all(&len.to_le_bytes()).map_err(|e| {
+            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+        })?;
+        stream.write_all(&data).map_err(|e| {
+            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+        })?;
+
+        let mut len_buf = [0u8; 4];
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(IpcError::ConnectionClosed);
+            }
+            Err(e) if is_timeout(&e) => return Err(IpcError::Timeout(e)),
+            Err(e) => return Err(IpcError::Io(e)),
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        if len > MAX_MESSAGE_SIZE {
+            return Err(IpcError::Io(std::io::Error::other("message too large")));
+        }
+
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).map_err(|e| {
+            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+        })?;
         Ok(rmp_serde::from_slice(&buf)?)
     }
 
