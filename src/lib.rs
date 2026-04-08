@@ -347,7 +347,11 @@ impl Client {
     ///
     /// Identical to `call` but sets read and write timeouts on the socket after connecting.
     /// Returns `IpcError::Timeout` if any I/O operation exceeds the given duration.
-    pub fn call_timeout<P, Req, Res>(path: P, request: &Req, timeout: Duration) -> Result<Res, IpcError>
+    pub fn call_timeout<P, Req, Res>(
+        path: P,
+        request: &Req,
+        timeout: Duration,
+    ) -> Result<Res, IpcError>
     where
         P: AsRef<Path>,
         Req: Serialize,
@@ -360,10 +364,18 @@ impl Client {
         let data = rmp_serde::to_vec(request)?;
         let len = data.len() as u32;
         stream.write_all(&len.to_le_bytes()).map_err(|e| {
-            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+            if is_timeout(&e) {
+                IpcError::Timeout(e)
+            } else {
+                IpcError::Io(e)
+            }
         })?;
         stream.write_all(&data).map_err(|e| {
-            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+            if is_timeout(&e) {
+                IpcError::Timeout(e)
+            } else {
+                IpcError::Io(e)
+            }
         })?;
 
         let mut len_buf = [0u8; 4];
@@ -383,7 +395,11 @@ impl Client {
 
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).map_err(|e| {
-            if is_timeout(&e) { IpcError::Timeout(e) } else { IpcError::Io(e) }
+            if is_timeout(&e) {
+                IpcError::Timeout(e)
+            } else {
+                IpcError::Io(e)
+            }
         })?;
         Ok(rmp_serde::from_slice(&buf)?)
     }
