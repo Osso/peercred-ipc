@@ -11,6 +11,53 @@ struct OpenDeviceResponse {
     success: bool,
 }
 
+async fn wait_for_server_ready() {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
+fn assert_fd_reads_eof(fd: &OwnedFd) {
+    use std::io::Read;
+
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd.as_raw_fd()) };
+    let mut buf = [0u8; 1];
+    assert_eq!(file.read(&mut buf).unwrap(), 0);
+    std::mem::forget(file);
+}
+
+fn call_recv_open_device(path: String) -> (OpenDeviceResponse, Vec<OwnedFd>) {
+    Client::call_recv_fds(
+        &path,
+        &OpenDeviceRequest {
+            path: "/dev/null".to_string(),
+        },
+    )
+    .unwrap()
+}
+
+fn call_send_file(path: String) -> StringMessage {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    Client::call_send_fds(
+        &path,
+        &StringMessage {
+            text: "here's a file".to_string(),
+        },
+        &[file.as_raw_fd()],
+    )
+    .unwrap()
+}
+
+fn call_with_client_fd(path: String) -> (StringMessage, Vec<OwnedFd>) {
+    let client_file = std::fs::File::open("/dev/null").unwrap();
+    Client::call_with_fds(
+        &path,
+        &StringMessage {
+            text: "client fd".to_string(),
+        },
+        &[client_file.as_raw_fd()],
+    )
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_sends_fd_to_client() {
     let socket_path = unique_socket_path("fd-server-to-client");
@@ -36,22 +83,10 @@ async fn server_sends_fd_to_client() {
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        let (resp, fds): (OpenDeviceResponse, Vec<OwnedFd>) = Client::call_recv_fds(
-            &path,
-            &OpenDeviceRequest {
-                path: "/dev/null".to_string(),
-            },
-        )
-        .unwrap();
-
+        let (resp, fds) = call_recv_open_device(path);
         assert!(resp.success);
         assert_eq!(fds.len(), 1);
-
-        use std::io::Read;
-        let mut f = unsafe { std::fs::File::from_raw_fd(fds[0].as_raw_fd()) };
-        let mut buf = [0u8; 1];
-        assert_eq!(f.read(&mut buf).unwrap(), 0);
-        std::mem::forget(f);
+        assert_fd_reads_eof(&fds[0]);
     })
     .await
     .unwrap();
@@ -72,12 +107,7 @@ async fn client_sends_fd_to_server() {
 
         assert_eq!(req.text, "here's a file");
         assert_eq!(fds.len(), 1);
-
-        use std::io::Read;
-        let mut f = unsafe { std::fs::File::from_raw_fd(fds[0].as_raw_fd()) };
-        let mut buf = [0u8; 1];
-        assert_eq!(f.read(&mut buf).unwrap(), 0);
-        std::mem::forget(f);
+        assert_fd_reads_eof(&fds[0]);
 
         conn.write_with_fds(
             &StringMessage {
@@ -89,22 +119,11 @@ async fn client_sends_fd_to_server() {
         .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_server_ready().await;
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::open("/dev/null").unwrap();
-        let fd = file.as_raw_fd();
-
-        let resp: StringMessage = Client::call_send_fds(
-            &path,
-            &StringMessage {
-                text: "here's a file".to_string(),
-            },
-            &[fd],
-        )
-        .unwrap();
-
+        let resp = call_send_file(path);
         assert_eq!(resp.text, "received");
     })
     .await
@@ -177,21 +196,11 @@ async fn bidirectional_fd_passing() {
         .unwrap();
     });
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_server_ready().await;
 
     let path = socket_path.clone();
     tokio::task::spawn_blocking(move || {
-        let client_file = std::fs::File::open("/dev/null").unwrap();
-
-        let (resp, server_fds): (StringMessage, Vec<OwnedFd>) = Client::call_with_fds(
-            &path,
-            &StringMessage {
-                text: "client fd".to_string(),
-            },
-            &[client_file.as_raw_fd()],
-        )
-        .unwrap();
-
+        let (resp, server_fds) = call_with_client_fd(path);
         assert_eq!(resp.text, "server fd");
         assert_eq!(server_fds.len(), 1);
     })

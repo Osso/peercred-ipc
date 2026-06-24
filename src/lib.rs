@@ -310,6 +310,43 @@ impl Connection {
 pub struct Client;
 
 impl Client {
+    fn map_io_timeout(e: std::io::Error) -> IpcError {
+        if is_timeout(&e) {
+            IpcError::Timeout(e)
+        } else {
+            IpcError::Io(e)
+        }
+    }
+
+    fn write_request(stream: &mut UnixStream, data: &[u8]) -> Result<(), IpcError> {
+        let len = data.len() as u32;
+        stream
+            .write_all(&len.to_le_bytes())
+            .map_err(Self::map_io_timeout)?;
+        stream.write_all(data).map_err(Self::map_io_timeout)
+    }
+
+    fn read_response_len(stream: &mut UnixStream) -> Result<usize, IpcError> {
+        let mut len_buf = [0u8; 4];
+        match stream.read_exact(&mut len_buf) {
+            Ok(()) => Ok(u32::from_le_bytes(len_buf) as usize),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                Err(IpcError::ConnectionClosed)
+            }
+            Err(e) => Err(Self::map_io_timeout(e)),
+        }
+    }
+
+    fn read_response_data(stream: &mut UnixStream, len: usize) -> Result<Vec<u8>, IpcError> {
+        if len > MAX_MESSAGE_SIZE {
+            return Err(IpcError::Io(std::io::Error::other("message too large")));
+        }
+
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).map_err(Self::map_io_timeout)?;
+        Ok(buf)
+    }
+
     /// Connect to a socket and perform a single request/response exchange (length-prefixed)
     pub fn call<P, Req, Res>(path: P, request: &Req) -> Result<Res, IpcError>
     where
@@ -362,45 +399,9 @@ impl Client {
         stream.set_write_timeout(Some(timeout))?;
 
         let data = rmp_serde::to_vec(request)?;
-        let len = data.len() as u32;
-        stream.write_all(&len.to_le_bytes()).map_err(|e| {
-            if is_timeout(&e) {
-                IpcError::Timeout(e)
-            } else {
-                IpcError::Io(e)
-            }
-        })?;
-        stream.write_all(&data).map_err(|e| {
-            if is_timeout(&e) {
-                IpcError::Timeout(e)
-            } else {
-                IpcError::Io(e)
-            }
-        })?;
-
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(IpcError::ConnectionClosed);
-            }
-            Err(e) if is_timeout(&e) => return Err(IpcError::Timeout(e)),
-            Err(e) => return Err(IpcError::Io(e)),
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-
-        if len > MAX_MESSAGE_SIZE {
-            return Err(IpcError::Io(std::io::Error::other("message too large")));
-        }
-
-        let mut buf = vec![0u8; len];
-        stream.read_exact(&mut buf).map_err(|e| {
-            if is_timeout(&e) {
-                IpcError::Timeout(e)
-            } else {
-                IpcError::Io(e)
-            }
-        })?;
+        Self::write_request(&mut stream, &data)?;
+        let len = Self::read_response_len(&mut stream)?;
+        let buf = Self::read_response_data(&mut stream, len)?;
         Ok(rmp_serde::from_slice(&buf)?)
     }
 

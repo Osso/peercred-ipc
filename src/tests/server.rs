@@ -1,6 +1,64 @@
 use super::*;
 use std::time::Duration;
 
+async fn wait_for_server_ready() {
+    tokio::time::sleep(Duration::from_millis(10)).await;
+}
+
+async fn accept_and_serve_concurrent(server: Server, num_clients: i32) {
+    let mut handles = Vec::with_capacity(num_clients as usize);
+    for _ in 0..num_clients {
+        let (mut conn, _) = server.accept().await.unwrap();
+        handles.push(tokio::spawn(async move {
+            let req: TestRequest = conn.read().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            conn.write(&TestResponse {
+                doubled: req.value * 2,
+            })
+            .await
+            .unwrap();
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}
+
+fn spawn_concurrent_client(socket_path: &str, value: i32) -> tokio::task::JoinHandle<()> {
+    let path = socket_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        let resp: TestResponse = Client::call(&path, &TestRequest { value }).unwrap();
+        assert_eq!(resp.doubled, value * 2);
+    })
+}
+
+fn write_framed<T: serde::Serialize>(stream: &mut UnixStream, msg: &T) {
+    let data = rmp_serde::to_vec(msg).unwrap();
+    stream
+        .write_all(&(data.len() as u32).to_le_bytes())
+        .unwrap();
+    stream.write_all(&data).unwrap();
+}
+
+fn read_framed<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> T {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).unwrap();
+    let len = u32::from_le_bytes(len_buf) as usize;
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).unwrap();
+    rmp_serde::from_slice(&buf).unwrap()
+}
+
+fn run_three_roundtrips(path: String) {
+    let mut stream = UnixStream::connect(path).unwrap();
+    for i in 0..3 {
+        write_framed(&mut stream, &TestRequest { value: i * 10 });
+        let resp: TestResponse = read_framed(&mut stream);
+        assert_eq!(resp.doubled, i * 20);
+    }
+}
+
 #[tokio::test]
 async fn server_removes_existing_socket_on_bind() {
     let socket_path = unique_socket_path("rebind");
@@ -81,34 +139,14 @@ async fn server_handles_concurrent_connections() {
     let server = Server::bind(&socket_path).unwrap();
     let num_clients = 5;
 
-    let server_handle = tokio::spawn(async move {
-        let mut handles = vec![];
-        for _ in 0..num_clients {
-            let (mut conn, _) = server.accept().await.unwrap();
-            handles.push(tokio::spawn(async move {
-                let req: TestRequest = conn.read().await.unwrap();
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                conn.write(&TestResponse {
-                    doubled: req.value * 2,
-                })
-                .await
-                .unwrap();
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-    });
+    let server_handle =
+        tokio::spawn(async move { accept_and_serve_concurrent(server, num_clients).await });
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_server_ready().await;
 
     let mut client_handles = vec![];
     for i in 0..num_clients {
-        let path = socket_path.clone();
-        client_handles.push(tokio::task::spawn_blocking(move || {
-            let resp: TestResponse = Client::call(&path, &TestRequest { value: i }).unwrap();
-            assert_eq!(resp.doubled, i * 2);
-        }));
+        client_handles.push(spawn_concurrent_client(&socket_path, i));
     }
 
     for h in client_handles {
@@ -138,34 +176,12 @@ async fn connection_multiple_read_write_cycles() {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    wait_for_server_ready().await;
 
     let path = socket_path.clone();
-    tokio::task::spawn_blocking(move || {
-        // Use raw connection with length-prefixed framing
-        let mut stream = UnixStream::connect(&path).unwrap();
-
-        for i in 0..3 {
-            let req = TestRequest { value: i * 10 };
-            let data = rmp_serde::to_vec(&req).unwrap();
-            // Write length prefix + data
-            stream
-                .write_all(&(data.len() as u32).to_le_bytes())
-                .unwrap();
-            stream.write_all(&data).unwrap();
-
-            // Read length prefix + data
-            let mut len_buf = [0u8; 4];
-            stream.read_exact(&mut len_buf).unwrap();
-            let len = u32::from_le_bytes(len_buf) as usize;
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).unwrap();
-            let resp: TestResponse = rmp_serde::from_slice(&buf).unwrap();
-            assert_eq!(resp.doubled, i * 20);
-        }
-    })
-    .await
-    .unwrap();
+    tokio::task::spawn_blocking(move || run_three_roundtrips(path))
+        .await
+        .unwrap();
 
     server_handle.await.unwrap();
     let _ = fs::remove_file(&socket_path);
