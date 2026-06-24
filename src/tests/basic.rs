@@ -189,6 +189,289 @@ fn ipc_error_display_connection_closed() {
     assert_eq!(err.to_string(), "connection closed");
 }
 
+#[test]
+fn is_timeout_detects_timeout_kinds() {
+    let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "slow");
+    let would_block = std::io::Error::new(std::io::ErrorKind::WouldBlock, "blocked");
+    let interrupted = std::io::Error::new(std::io::ErrorKind::Interrupted, "retry");
+
+    assert!(is_timeout(&timed_out));
+    assert!(is_timeout(&would_block));
+    assert!(!is_timeout(&interrupted));
+}
+
+#[test]
+fn fd_helpers_report_invalid_socket_errors() {
+    let mut buf = [0u8; 8];
+
+    assert!(matches!(
+        sendmsg_with_fds(-1, b"x", &[]),
+        Err(IpcError::Io(_))
+    ));
+    assert!(matches!(
+        sendmsg_with_fds(-1, b"x", &[0]),
+        Err(IpcError::Io(_))
+    ));
+    assert!(matches!(
+        recvmsg_with_fds(-1, &mut buf),
+        Err(IpcError::Io(_))
+    ));
+}
+
+#[test]
+fn fd_recv_reports_connection_closed() {
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(writer);
+
+    let mut buf = [0u8; 8];
+    let result = recvmsg_with_fds(reader.as_raw_fd(), &mut buf);
+
+    assert!(matches!(result, Err(IpcError::ConnectionClosed)));
+}
+
+#[test]
+fn fd_recv_ignores_non_rights_control_messages() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let enable: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            reader.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PASSCRED,
+            &enable as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&enable) as libc::socklen_t,
+        )
+    };
+    assert_eq!(ret, 0);
+
+    writer.write_all(b"x").unwrap();
+
+    let mut buf = [0u8; 8];
+    let (len, fds) = recvmsg_with_fds(reader.as_raw_fd(), &mut buf).unwrap();
+
+    assert_eq!(len, 1);
+    assert!(fds.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_reports_connection_closed_without_response() {
+    let socket_path = unique_socket_path("call-closed-response");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        conn.stream.write_all(&[0]).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> =
+        tokio::task::spawn_blocking(move || Client::call(&path, &TestRequest { value: 1 }))
+            .await
+            .unwrap();
+
+    assert!(matches!(result, Err(IpcError::ConnectionClosed)));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_rejects_oversized_response() {
+    let socket_path = unique_socket_path("call-oversized-response");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        let oversized_len = (MAX_MESSAGE_SIZE as u32) + 1;
+        conn.stream
+            .write_all(&oversized_len.to_le_bytes())
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> =
+        tokio::task::spawn_blocking(move || Client::call(&path, &TestRequest { value: 1 }))
+            .await
+            .unwrap();
+
+    assert!(matches!(result, Err(IpcError::Io(_))));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_read_rejects_oversized_message() {
+    let socket_path = unique_socket_path("connection-oversized");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let result: Result<TestRequest, IpcError> = conn.read().await;
+        assert!(matches!(result, Err(IpcError::Io(_))));
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = UnixStream::connect(path).unwrap();
+        let oversized_len = (MAX_MESSAGE_SIZE as u32) + 1;
+        stream.write_all(&oversized_len.to_le_bytes()).unwrap();
+    })
+    .await
+    .unwrap();
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_timeout_roundtrip() {
+    let socket_path = unique_socket_path("call-timeout-roundtrip");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let req: TestRequest = conn.read().await.unwrap();
+        conn.write(&TestResponse {
+            doubled: req.value * 2,
+        })
+        .await
+        .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let resp: TestResponse = tokio::task::spawn_blocking(move || {
+        Client::call_timeout(&path, &TestRequest { value: 12 }, Duration::from_secs(1)).unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(resp.doubled, 24);
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_timeout_reports_partial_length_eof() {
+    let socket_path = unique_socket_path("call-timeout-partial-len");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        conn.stream.write_all(&[0]).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> = tokio::task::spawn_blocking(move || {
+        Client::call_timeout(&path, &TestRequest { value: 1 }, Duration::from_secs(1))
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(IpcError::ConnectionClosed)));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_timeout_reports_partial_body_eof() {
+    let socket_path = unique_socket_path("call-timeout-partial-body");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        conn.stream.write_all(&4u32.to_le_bytes()).await.unwrap();
+        conn.stream.write_all(&[1]).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> = tokio::task::spawn_blocking(move || {
+        Client::call_timeout(&path, &TestRequest { value: 1 }, Duration::from_secs(1))
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(IpcError::Io(_))));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_timeout_reports_read_timeout() {
+    let socket_path = unique_socket_path("call-timeout-read");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> = tokio::task::spawn_blocking(move || {
+        Client::call_timeout(&path, &TestRequest { value: 1 }, Duration::from_millis(5))
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(IpcError::Timeout(_))));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_call_timeout_rejects_oversized_response() {
+    let socket_path = unique_socket_path("call-timeout-oversized");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let _: TestRequest = conn.read().await.unwrap();
+        let oversized_len = (MAX_MESSAGE_SIZE as u32) + 1;
+        conn.stream
+            .write_all(&oversized_len.to_le_bytes())
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<TestResponse, IpcError> = tokio::task::spawn_blocking(move || {
+        Client::call_timeout(&path, &TestRequest { value: 1 }, Duration::from_secs(1))
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(IpcError::Io(_))));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rapid_connect_disconnect() {
     let socket_path = unique_socket_path("rapid");

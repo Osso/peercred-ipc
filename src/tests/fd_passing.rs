@@ -238,6 +238,40 @@ async fn message_without_fds_using_fd_methods() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_send_fds_reports_connection_closed_without_response() {
+    let socket_path = unique_socket_path("fd-send-closed");
+
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let (_req, fds): (StringMessage, Vec<OwnedFd>) = conn.read_with_fds().await.unwrap();
+        assert_eq!(fds.len(), 1);
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let result: Result<StringMessage, IpcError> = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        Client::call_send_fds(
+            &path,
+            &StringMessage {
+                text: "close response".to_string(),
+            },
+            &[file.as_raw_fd()],
+        )
+    })
+    .await
+    .unwrap();
+
+    assert!(matches!(result, Err(IpcError::ConnectionClosed)));
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn async_connection_fd_roundtrip() {
     let socket_path = unique_socket_path("fd-async-roundtrip");
 
