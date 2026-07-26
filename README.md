@@ -13,6 +13,20 @@ Unix socket IPC with msgpack serialization and SO_PEERCRED caller info.
 - **Caller identification** - SO_PEERCRED provides uid, gid, pid, and exe path of the connecting process
 - **Async server** - Tokio-based async server for handling connections
 - **Sync client** - Simple blocking client for request/response patterns
+- **Disconnect-aware server** - Additive `Connection::split` API with independent reader and writer halves
+
+## Wire protocol
+
+The protocol remains the legacy raw MessagePack format. Requests and responses
+are serialized directly to the Unix stream with no length-prefix or other
+framing header. Existing `Connection::read` and `Connection::write` callers
+remain compatible.
+
+`Connection::split` consumes a connection and returns
+`ConnectionReader`/`ConnectionWriter`. After reading a request, a server can
+call `ConnectionReader::wait_for_disconnect()` to observe caller EOF while
+retaining `ConnectionWriter` for the response. Clients that still need a
+response should half-close their write side, not close the entire socket.
 
 ## Example
 
@@ -27,6 +41,15 @@ loop {
     let request: MyRequest = conn.read().await?;
     conn.write(&MyResponse::Ok).await?;
 }
+```
+
+Disconnect-aware server:
+```rust
+let (conn, _caller) = server.accept().await?;
+let (mut reader, mut writer) = conn.split();
+let request: MyRequest = reader.read().await?;
+reader.wait_for_disconnect().await?;
+writer.write(&MyResponse::Ok).await?;
 ```
 
 Client:

@@ -1,8 +1,20 @@
 //! Unix socket IPC with msgpack serialization and SO_PEERCRED caller info
 //!
 //! Provides simple request/response communication over Unix sockets
-//! using MessagePack for fast binary serialization. Includes caller
-//! identification via SO_PEERCRED (uid, gid, pid, exe path).
+//! using raw MessagePack bytes. Includes caller identification via
+//! SO_PEERCRED (uid, gid, pid, exe path).
+//!
+//! The wire protocol is intentionally legacy-compatible: each request and
+//! response is written as raw MessagePack bytes directly to the Unix stream.
+//! There is no length-prefix or other framing header. Existing
+//! [`Connection::read`] and [`Connection::write`] calls remain available for
+//! this protocol.
+//!
+//! [`Connection::split`] is an additive API for servers that need to monitor
+//! caller disconnects while retaining an independent response writer. It
+//! returns [`ConnectionReader`] and [`ConnectionWriter`] owned halves. After
+//! reading the request, call [`ConnectionReader::wait_for_disconnect`] to wait
+//! for the client to close its write side, then use the writer for the response.
 //!
 //! # Example
 //!
@@ -167,12 +179,18 @@ where
 }
 
 /// An active connection to a client.
+///
+/// `Connection::read` and `Connection::write` preserve the legacy raw
+/// MessagePack protocol: messages have no length-prefix framing header.
 pub struct Connection {
     stream: TokioUnixStream,
 }
 
 impl Connection {
     /// Split this connection into independently owned read and write halves.
+    ///
+    /// This consumes the connection. Use the reader to observe caller EOF
+    /// while the writer remains available for the response.
     pub fn split(self) -> (ConnectionReader, ConnectionWriter) {
         let (reader, writer) = self.stream.into_split();
         (
@@ -193,6 +211,8 @@ impl Connection {
 }
 
 /// Owned read half of a client connection.
+///
+/// Reads use the legacy raw MessagePack protocol without a framing header.
 pub struct ConnectionReader {
     stream: OwnedReadHalf,
 }
@@ -205,7 +225,10 @@ impl ConnectionReader {
 
     /// Wait for the client to close its write side.
     ///
-    /// Call this after reading the request. Additional data is a protocol error.
+    /// Call this after reading the request. A clean EOF confirms disconnect;
+    /// additional bytes are reported as a protocol error. A client that still
+    /// needs the response should half-close its write side rather than close
+    /// the entire socket.
     pub async fn wait_for_disconnect(&mut self) -> Result<(), IpcError> {
         let mut trailing = [0u8; 1];
         match self.stream.read(&mut trailing).await {
@@ -220,6 +243,8 @@ impl ConnectionReader {
 }
 
 /// Owned write half of a client connection.
+///
+/// Writes use the legacy raw MessagePack protocol without a framing header.
 pub struct ConnectionWriter {
     stream: OwnedWriteHalf,
 }
