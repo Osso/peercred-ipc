@@ -35,7 +35,8 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream as TokioUnixStream};
 
 /// Maximum message size (4 MB - larger for screenshots)
@@ -237,40 +238,65 @@ impl Server {
     }
 }
 
-/// An active connection to a client
+async fn read_message<R, T>(stream: &mut R) -> Result<T, IpcError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(IpcError::ConnectionClosed);
+        }
+        Err(error) => return Err(IpcError::Io(error)),
+    }
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    if len > MAX_MESSAGE_SIZE {
+        return Err(IpcError::Io(std::io::Error::other("message too large")));
+    }
+
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;
+    Ok(rmp_serde::from_slice(&buf)?)
+}
+
+async fn write_message<W, T>(stream: &mut W, message: &T) -> Result<(), IpcError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let data = rmp_serde::to_vec(message)?;
+    let len = data.len() as u32;
+    stream.write_all(&len.to_le_bytes()).await?;
+    stream.write_all(&data).await?;
+    Ok(())
+}
+
+/// An active connection to a client.
 pub struct Connection {
     stream: TokioUnixStream,
 }
 
 impl Connection {
-    /// Read a message from the connection (length-prefixed)
-    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
-        let mut len_buf = [0u8; 4];
-        match self.stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                return Err(IpcError::ConnectionClosed);
-            }
-            Err(e) => return Err(IpcError::Io(e)),
-        }
-        let len = u32::from_le_bytes(len_buf) as usize;
-
-        if len > MAX_MESSAGE_SIZE {
-            return Err(IpcError::Io(std::io::Error::other("message too large")));
-        }
-
-        let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf).await?;
-        Ok(rmp_serde::from_slice(&buf)?)
+    /// Split this connection into independently owned read and write halves.
+    pub fn split(self) -> (ConnectionReader, ConnectionWriter) {
+        let (reader, writer) = self.stream.into_split();
+        (
+            ConnectionReader { stream: reader },
+            ConnectionWriter { stream: writer },
+        )
     }
 
-    /// Write a message to the connection (length-prefixed)
+    /// Read a message from the connection (length-prefixed).
+    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
+        read_message(&mut self.stream).await
+    }
+
+    /// Write a message to the connection (length-prefixed).
     pub async fn write<T: Serialize>(&mut self, msg: &T) -> Result<(), IpcError> {
-        let data = rmp_serde::to_vec(msg)?;
-        let len = data.len() as u32;
-        self.stream.write_all(&len.to_le_bytes()).await?;
-        self.stream.write_all(&data).await?;
-        Ok(())
+        write_message(&mut self.stream, msg).await
     }
 
     /// Read a message with file descriptors from the connection
@@ -303,6 +329,46 @@ impl Connection {
         let fd = self.stream.as_raw_fd();
         sendmsg_with_fds(fd, &data, fds)?;
         Ok(())
+    }
+}
+
+/// Owned read half of a client connection.
+pub struct ConnectionReader {
+    stream: OwnedReadHalf,
+}
+
+impl ConnectionReader {
+    /// Read a message from the connection (length-prefixed).
+    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
+        read_message(&mut self.stream).await
+    }
+
+    /// Wait for the client to close its write side.
+    ///
+    /// This must be called after the request has been read. Additional client
+    /// data is a protocol error rather than a disconnect signal.
+    pub async fn wait_for_disconnect(&mut self) -> Result<(), IpcError> {
+        let mut trailing = [0u8; 1];
+        match self.stream.read(&mut trailing).await {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected data after request",
+            ))),
+            Err(error) => Err(IpcError::Io(error)),
+        }
+    }
+}
+
+/// Owned write half of a client connection.
+pub struct ConnectionWriter {
+    stream: OwnedWriteHalf,
+}
+
+impl ConnectionWriter {
+    /// Write a message to the connection (length-prefixed).
+    pub async fn write<T: Serialize>(&mut self, message: &T) -> Result<(), IpcError> {
+        write_message(&mut self.stream, message).await
     }
 }
 

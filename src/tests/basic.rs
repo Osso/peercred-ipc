@@ -1,5 +1,26 @@
 use super::*;
+use std::net::Shutdown;
 use std::time::Duration;
+
+fn write_request(stream: &mut UnixStream, request: &TestRequest) {
+    let data = rmp_serde::to_vec(request).unwrap();
+    stream
+        .write_all(&(data.len() as u32).to_le_bytes())
+        .unwrap();
+    stream.write_all(&data).unwrap();
+}
+
+fn send_request_then_half_close(path: String, request: TestRequest) -> TestResponse {
+    let mut stream = UnixStream::connect(path).unwrap();
+    write_request(&mut stream, &request);
+    stream.shutdown(Shutdown::Write).unwrap();
+
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).unwrap();
+    let mut data = vec![0u8; u32::from_le_bytes(length) as usize];
+    stream.read_exact(&mut data).unwrap();
+    rmp_serde::from_slice(&data).unwrap()
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roundtrip() {
@@ -82,6 +103,71 @@ async fn client_connect_to_nonexistent_socket_fails() {
         }
         e => panic!("Expected Io error, got {:?}", e),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_connection_detects_eof_and_keeps_writer_available() {
+    let socket_path = unique_socket_path("split-eof");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (connection, _) = server.accept().await.unwrap();
+        let (mut reader, mut writer) = connection.split();
+        let request: TestRequest = reader.read().await.unwrap();
+
+        reader.wait_for_disconnect().await.unwrap();
+        writer
+            .write(&TestResponse {
+                doubled: request.value * 2,
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        send_request_then_half_close(path, TestRequest { value: 21 })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(response.doubled, 42);
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_connection_rejects_trailing_client_data_as_disconnect() {
+    let socket_path = unique_socket_path("split-trailing-data");
+    let server = Server::bind(&socket_path).unwrap();
+
+    let server_handle = tokio::spawn(async move {
+        let (connection, _) = server.accept().await.unwrap();
+        let (mut reader, _) = connection.split();
+        let _: TestRequest = reader.read().await.unwrap();
+
+        let error = reader.wait_for_disconnect().await.unwrap_err();
+        match error {
+            IpcError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::InvalidData),
+            other => panic!("expected invalid trailing data, got {other:?}"),
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let path = socket_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut stream = UnixStream::connect(path).unwrap();
+        write_request(&mut stream, &TestRequest { value: 1 });
+        stream.write_all(&[1]).unwrap();
+    })
+    .await
+    .unwrap();
+
+    server_handle.await.unwrap();
+    let _ = fs::remove_file(&socket_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
