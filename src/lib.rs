@@ -33,7 +33,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream as TokioUnixStream};
 
 /// Maximum message size (64 KB)
@@ -142,27 +143,91 @@ impl Server {
     }
 }
 
-/// An active connection to a client
+async fn read_message<R, T>(stream: &mut R) -> Result<T, IpcError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+    let length = stream.read(&mut buf).await?;
+    if length == 0 {
+        return Err(IpcError::ConnectionClosed);
+    }
+    Ok(rmp_serde::from_slice(&buf[..length])?)
+}
+
+async fn write_message<W, T>(stream: &mut W, message: &T) -> Result<(), IpcError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let data = rmp_serde::to_vec(message)?;
+    stream.write_all(&data).await?;
+    Ok(())
+}
+
+/// An active connection to a client.
 pub struct Connection {
     stream: TokioUnixStream,
 }
 
 impl Connection {
-    /// Read a message from the connection
-    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
-        let n = self.stream.read(&mut buf).await?;
-        if n == 0 {
-            return Err(IpcError::ConnectionClosed);
-        }
-        Ok(rmp_serde::from_slice(&buf[..n])?)
+    /// Split this connection into independently owned read and write halves.
+    pub fn split(self) -> (ConnectionReader, ConnectionWriter) {
+        let (reader, writer) = self.stream.into_split();
+        (
+            ConnectionReader { stream: reader },
+            ConnectionWriter { stream: writer },
+        )
     }
 
-    /// Write a message to the connection
+    /// Read a message from the connection.
+    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
+        read_message(&mut self.stream).await
+    }
+
+    /// Write a message to the connection.
     pub async fn write<T: Serialize>(&mut self, msg: &T) -> Result<(), IpcError> {
-        let data = rmp_serde::to_vec(msg)?;
-        self.stream.write_all(&data).await?;
-        Ok(())
+        write_message(&mut self.stream, msg).await
+    }
+}
+
+/// Owned read half of a client connection.
+pub struct ConnectionReader {
+    stream: OwnedReadHalf,
+}
+
+impl ConnectionReader {
+    /// Read a message from the connection.
+    pub async fn read<T: DeserializeOwned>(&mut self) -> Result<T, IpcError> {
+        read_message(&mut self.stream).await
+    }
+
+    /// Wait for the client to close its write side.
+    ///
+    /// Call this after reading the request. Additional data is a protocol error.
+    pub async fn wait_for_disconnect(&mut self) -> Result<(), IpcError> {
+        let mut trailing = [0u8; 1];
+        match self.stream.read(&mut trailing).await {
+            Ok(0) => Ok(()),
+            Ok(_) => Err(IpcError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected data after request",
+            ))),
+            Err(error) => Err(IpcError::Io(error)),
+        }
+    }
+}
+
+/// Owned write half of a client connection.
+pub struct ConnectionWriter {
+    stream: OwnedWriteHalf,
+}
+
+impl ConnectionWriter {
+    /// Write a message to the connection.
+    pub async fn write<T: Serialize>(&mut self, message: &T) -> Result<(), IpcError> {
+        write_message(&mut self.stream, message).await
     }
 }
 
@@ -194,6 +259,7 @@ impl Client {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use std::net::Shutdown;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
@@ -230,6 +296,21 @@ mod tests {
         text: String,
     }
 
+    fn write_raw_request(stream: &mut UnixStream, request: &TestRequest) {
+        let data = rmp_serde::to_vec(request).unwrap();
+        stream.write_all(&data).unwrap();
+    }
+
+    fn send_raw_request_then_half_close(path: String, request: TestRequest) -> TestResponse {
+        let mut stream = UnixStream::connect(path).unwrap();
+        write_raw_request(&mut stream, &request);
+        stream.shutdown(Shutdown::Write).unwrap();
+
+        let mut data = vec![0u8; MAX_MESSAGE_SIZE];
+        let length = stream.read(&mut data).unwrap();
+        rmp_serde::from_slice(&data[..length]).unwrap()
+    }
+
     // ============================================================
     // Basic roundtrip tests
     // ============================================================
@@ -261,6 +342,38 @@ mod tests {
         .unwrap();
         assert_eq!(resp.doubled, 42);
 
+        server_handle.await.unwrap();
+        let _ = fs::remove_file(&socket_path);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_connection_detects_raw_eof_and_keeps_writer_available() {
+        let socket_path = unique_socket_path("split-raw-eof");
+        let server = Server::bind(&socket_path).unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (connection, _) = server.accept().await.unwrap();
+            let (mut reader, mut writer) = connection.split();
+            let request: TestRequest = reader.read().await.unwrap();
+
+            reader.wait_for_disconnect().await.unwrap();
+            writer
+                .write(&TestResponse {
+                    doubled: request.value * 2,
+                })
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let path = socket_path.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            send_raw_request_then_half_close(path, TestRequest { value: 21 })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(response.doubled, 42);
         server_handle.await.unwrap();
         let _ = fs::remove_file(&socket_path);
     }
