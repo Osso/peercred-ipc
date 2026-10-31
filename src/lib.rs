@@ -26,7 +26,7 @@
 //! let response: MyResponse = Client::call("/run/myapp.sock", &request)?;
 //! ```
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::fs;
 use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -39,8 +39,17 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream as TokioUnixStream};
 
-/// Maximum message size (4 MB - larger for screenshots)
-pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum size of a length-prefixed MessagePack frame (64 MiB).
+/// This leaves room for large scene diagnostics while bounding allocation per peer.
+pub const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+const MAX_FD_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+
+fn frame_length(length: usize) -> Result<u32, IpcError> {
+    if length > MAX_MESSAGE_SIZE {
+        return Err(IpcError::Io(std::io::Error::other("message too large")));
+    }
+    Ok(length as u32)
+}
 
 #[derive(Error, Debug)]
 pub enum IpcError {
@@ -268,7 +277,7 @@ where
     T: Serialize,
 {
     let data = rmp_serde::to_vec(message)?;
-    let len = data.len() as u32;
+    let len = frame_length(data.len())?;
     stream.write_all(&len.to_le_bytes()).await?;
     stream.write_all(&data).await?;
     Ok(())
@@ -308,7 +317,7 @@ impl Connection {
     ) -> Result<(T, Vec<OwnedFd>), IpcError> {
         self.stream.readable().await?;
         let fd = self.stream.as_raw_fd();
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_FD_MESSAGE_SIZE];
 
         let (n, fds) = recvmsg_with_fds(fd, &mut buf)?;
         let msg = rmp_serde::from_slice(&buf[..n])?;
@@ -385,7 +394,7 @@ impl Client {
     }
 
     fn write_request(stream: &mut UnixStream, data: &[u8]) -> Result<(), IpcError> {
-        let len = data.len() as u32;
+        let len = frame_length(data.len())?;
         stream
             .write_all(&len.to_le_bytes())
             .map_err(Self::map_io_timeout)?;
@@ -423,7 +432,7 @@ impl Client {
         let mut stream = UnixStream::connect(path)?;
 
         let data = rmp_serde::to_vec(request)?;
-        let len = data.len() as u32;
+        let len = frame_length(data.len())?;
         stream.write_all(&len.to_le_bytes())?;
         stream.write_all(&data)?;
 
@@ -487,7 +496,7 @@ impl Client {
         let data = rmp_serde::to_vec(request)?;
         sendmsg_with_fds(fd, &data, &[])?;
 
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_FD_MESSAGE_SIZE];
         let (n, fds) = recvmsg_with_fds(fd, &mut buf)?;
         let msg = rmp_serde::from_slice(&buf[..n])?;
         Ok((msg, fds))
@@ -510,7 +519,7 @@ impl Client {
         let data = rmp_serde::to_vec(request)?;
         sendmsg_with_fds(fd, &data, fds)?;
 
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_FD_MESSAGE_SIZE];
         let n = stream.read(&mut buf)?;
         if n == 0 {
             return Err(IpcError::ConnectionClosed);
@@ -535,7 +544,7 @@ impl Client {
         let data = rmp_serde::to_vec(request)?;
         sendmsg_with_fds(fd, &data, fds)?;
 
-        let mut buf = vec![0u8; MAX_MESSAGE_SIZE];
+        let mut buf = vec![0u8; MAX_FD_MESSAGE_SIZE];
         let (n, recv_fds) = recvmsg_with_fds(fd, &mut buf)?;
         let msg = rmp_serde::from_slice(&buf[..n])?;
         Ok((msg, recv_fds))

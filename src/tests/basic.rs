@@ -54,6 +54,33 @@ async fn roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frames_larger_than_four_mebibytes_roundtrip_in_both_directions() {
+    let socket_path = unique_socket_path("large-framed-roundtrip");
+    let server = Server::bind(&socket_path).unwrap();
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let request: StringMessage = conn.read().await.unwrap();
+        assert_eq!(request.text.len(), 5 * 1024 * 1024);
+        conn.write(&request).await.unwrap();
+    });
+    let path = socket_path.clone();
+    let response: StringMessage = tokio::task::spawn_blocking(move || {
+        Client::call(
+            &path,
+            &StringMessage {
+                text: "x".repeat(5 * 1024 * 1024),
+            },
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.text, "x".repeat(5 * 1024 * 1024));
+    server_handle.await.unwrap();
+    fs::remove_file(&socket_path).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roundtrip_with_string_data() {
     let socket_path = unique_socket_path("string");
 
