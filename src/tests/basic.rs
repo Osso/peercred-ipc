@@ -81,6 +81,35 @@ async fn frames_larger_than_four_mebibytes_roundtrip_in_both_directions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writers_reject_frames_exceeding_the_reader_limit() {
+    let socket_path = unique_socket_path("large-write-rejected");
+    let server = Server::bind(&socket_path).unwrap();
+    let server_handle = tokio::spawn(async move {
+        let (mut conn, _) = server.accept().await.unwrap();
+        let request: Result<StringMessage, IpcError> = conn.read().await;
+        assert!(matches!(request, Err(IpcError::ConnectionClosed)));
+        let oversized = StringMessage {
+            text: "x".repeat(MAX_MESSAGE_SIZE),
+        };
+        assert!(matches!(conn.write(&oversized).await, Err(IpcError::Io(_))));
+    });
+    let path = socket_path.clone();
+    let result: Result<StringMessage, IpcError> = tokio::task::spawn_blocking(move || {
+        Client::call(
+            &path,
+            &StringMessage {
+                text: "x".repeat(MAX_MESSAGE_SIZE),
+            },
+        )
+    })
+    .await
+    .unwrap();
+    assert!(matches!(result, Err(IpcError::Io(_))));
+    server_handle.await.unwrap();
+    fs::remove_file(&socket_path).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn roundtrip_with_string_data() {
     let socket_path = unique_socket_path("string");
 
